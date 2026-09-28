@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Network
 import UniformTypeIdentifiers
 
 private let keychainService = "tc002-focus-bridge"
@@ -37,7 +38,68 @@ enum EnvironmentError: LocalizedError {
     }
 }
 
+private final class ManagedADBServer {
+    private let lock = NSLock()
+    private var process: Process?
+    private var port: UInt16?
+
+    func ensureRunning(adb: String) throws -> UInt16 {
+        lock.lock(); defer { lock.unlock() }
+        guard adb != "/usr/bin/env" else { throw EnvironmentError.missingTool(name: "ADB", brewPackage: "android-platform-tools") }
+        if let process, process.isRunning, let port, Self.isListening(port) { return port }
+        if let process, process.isRunning { process.terminate() }
+        process = nil; port = nil
+
+        for _ in 0..<3 {
+            let candidate = UInt16.random(in: 43000...53000)
+            if Self.isListening(candidate) { continue }
+            let server = Process()
+            server.executableURL = URL(fileURLWithPath: adb)
+            server.arguments = ["-L", "tcp:\(candidate)", "nodaemon", "server"]
+            server.standardInput = FileHandle.nullDevice
+            server.standardOutput = FileHandle.nullDevice
+            server.standardError = FileHandle.nullDevice
+            try server.run()
+            for _ in 0..<20 {
+                if !server.isRunning { break }
+                if Self.isListening(candidate), server.isRunning {
+                    process = server; port = candidate
+                    return candidate
+                }
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+            if server.isRunning { server.terminate() }
+        }
+        throw RunnerError.failed("无法启动 GUI 专用 ADB 服务。请退出 App 后重试，并检查 macOS“本地网络”权限。")
+    }
+
+    func stop() {
+        lock.lock(); defer { lock.unlock() }
+        if let process, process.isRunning { process.terminate() }
+        process = nil; port = nil
+    }
+
+    private static func isListening(_ port: UInt16) -> Bool {
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return false }
+        let connection = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+        let completed = DispatchSemaphore(value: 0)
+        var ready = false
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready: ready = true; completed.signal()
+            case .failed: completed.signal()
+            default: break
+            }
+        }
+        connection.start(queue: DispatchQueue(label: "tc002-focus-adb-server-probe"))
+        let finished = completed.wait(timeout: .now() + 0.2) == .success
+        connection.cancel()
+        return finished && ready
+    }
+}
+
 final class AppModel {
+    private static let adbServer = ManagedADBServer()
     var deviceIP = ""
     var hostIP = ""
     var focusMinutes = "45"
@@ -131,14 +193,11 @@ final class AppModel {
             if shouldCheckDevice {
                 if let target = Self.adbTarget(device) {
                     do {
-                        let adb = Self.adbPath()
-                        _ = try Self.run(adb, args: adb == "/usr/bin/env" ? ["adb", "connect", target] : ["connect", target])
-                        let state = try Self.run(adb, args: adb == "/usr/bin/env" ? ["adb", "-s", target, "get-state"] : ["-s", target, "get-state"])
-                        guard state.trimmingCharacters(in: .whitespacesAndNewlines) == "device" else { throw RunnerError.failed("ADB 未返回 device 状态") }
+                        _ = try Self.connectDevice(target)
                         deviceReachable = true
                         messages.append("✓ TC002 自动连接检查通过")
                     } catch {
-                        messages.append("TC002 自动检查未通过：\(error.localizedDescription)")
+                        messages.append("TC002 自动检查未通过：\(Self.friendlyError(error.localizedDescription))")
                     }
                 } else {
                     messages.append(Self.invalidDeviceAddress)
@@ -250,13 +309,10 @@ final class AppModel {
         isBusy = true; status = "正在测试 TC002 连接…"; notify()
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let adb = Self.adbPath()
-                _ = try Self.run(adb, args: adb == "/usr/bin/env" ? ["adb", "connect", target] : ["connect", target])
-                let state = try Self.run(adb, args: adb == "/usr/bin/env" ? ["adb", "-s", target, "get-state"] : ["-s", target, "get-state"])
-                guard state.trimmingCharacters(in: .whitespacesAndNewlines) == "device" else { throw RunnerError.failed("ADB 未返回 device 状态") }
+                _ = try Self.connectDevice(target)
                 self.updateOnMain { self.isDeviceReachable = true; self.isBusy = false; self.status = "TC002 连接正常"; self.appendLog("时钟连接检查通过：\(target)"); self.notify() }
             } catch {
-                self.updateOnMain { self.isDeviceReachable = false; self.isBusy = false; self.status = "TC002 连接失败"; self.appendLog(error.localizedDescription); self.notify() }
+                self.updateOnMain { self.isDeviceReachable = false; self.isBusy = false; self.status = "TC002 连接失败"; self.appendLog(Self.friendlyError(error.localizedDescription)); self.notify() }
             }
         }
     }
@@ -319,27 +375,36 @@ final class AppModel {
         guard isAuthorized else { status = "请先完成 Lark 授权"; notify(); return }
         guard keychainValue(account: "app_id") == appID else { status = "App ID 已修改，请先重新授权 Lark"; notify(); return }
         guard FileManager.default.fileExists(atPath: repoPath + "/companion/install-macos.sh") else { status = "项目目录无效，找不到 companion/install-macos.sh"; notify(); return }
-        save(); isBusy = true; status = "正在启动本机服务并连接时钟…"; appendLog("准备启动：专注 \(focus) 分钟，休息 \(rest) 分钟，设备 \(deviceIP)"); notify()
+        save(); isBusy = true; status = "正在检查时钟连接…"; appendLog("准备启动：专注 \(focus) 分钟，休息 \(rest) 分钟，设备 \(deviceIP)"); notify()
         let focusSeconds = focus * 60; let restSeconds = rest * 60; let repo = repoPath; let host = hostIP; let audio = hasCustomAudio ? customAudioURL.path : nil
         DispatchQueue.global(qos: .userInitiated).async {
+            var deviceCheckStarted = false
+            var deviceConnected = false
             do {
-                self.updateOnMain { self.status = "1/4 检查运行环境…"; self.notify() }
+                self.updateOnMain { self.status = "1/5 检查运行环境…"; self.notify() }
                 try Self.preflight(repo: repo)
-                self.updateOnMain { self.isEnvironmentReady = true; self.status = "2/4 验证 Lark 系统状态…"; self.notify() }
+                self.updateOnMain { self.isEnvironmentReady = true; self.status = "2/5 连接 TC002…"; self.notify() }
+                deviceCheckStarted = true
+                let adbPort = try Self.connectDevice(device)
+                deviceConnected = true
+                self.updateOnMain { self.isDeviceReachable = true; self.status = "3/5 验证 Lark 系统状态…"; self.notify() }
                 let node = Self.nodePath()
                 let statusArgs = node == "/usr/bin/env" ? ["node", repo + "/bridge/setup-system-status.mjs"] : [repo + "/bridge/setup-system-status.mjs"]
                 let lark = try Self.run(node, args: statusArgs, cwd: repo)
-                self.updateOnMain { self.isLarkVerified = true; self.appendLog(lark); self.status = "3/4 安装并启动电脑助手…"; self.notify() }
+                self.updateOnMain { self.isLarkVerified = true; self.appendLog(lark); self.status = "4/5 安装并启动电脑助手…"; self.notify() }
                 let install = try Self.run("/bin/bash", args: [repo + "/companion/install-macos.sh", "--lan-host", host, "--mode", "real", "--focus-seconds", String(focusSeconds), "--rest-seconds", String(restSeconds), "--apply"], cwd: repo)
-                self.updateOnMain { self.appendLog(install); self.areServicesInstalled = true; self.areServicesRunning = true; self.status = "4/4 配置并启动 TC002…"; self.notify() }
-                let configure = try Self.run("/bin/bash", args: [repo + "/companion/configure-device.sh", "--adb-target", device, "--lan-host", host, "--focus-seconds", String(focusSeconds), "--rest-seconds", String(restSeconds)], cwd: repo)
+                self.updateOnMain { self.appendLog(install); self.areServicesInstalled = true; self.areServicesRunning = true; self.status = "5/5 配置并启动 TC002…"; self.notify() }
+                let configure = try Self.run("/bin/bash", args: [repo + "/companion/configure-device.sh", "--adb-target", device, "--lan-host", host, "--focus-seconds", String(focusSeconds), "--rest-seconds", String(restSeconds)], cwd: repo, adbServerPort: adbPort)
                 self.updateOnMain { self.appendLog(configure); self.isDeviceReachable = true; self.notify() }
                 var launchArgs = [repo + "/companion/start-focus.sh", "--adb-target", device]
                 if let audio { launchArgs += ["--audio", audio] }
-                let launch = try Self.run("/bin/bash", args: launchArgs, cwd: repo)
+                let launch = try Self.run("/bin/bash", args: launchArgs, cwd: repo, adbServerPort: adbPort)
                 self.updateOnMain { self.appendLog(launch); self.isBusy = false; self.status = "专注时钟已启动；设备重启后恢复原生界面"; self.notify() }
             } catch {
                 self.updateOnMain {
+                    if (deviceCheckStarted && !deviceConnected) || error.localizedDescription.localizedCaseInsensitiveContains("adb") {
+                        self.isDeviceReachable = false
+                    }
                     self.isBusy = false; self.status = "启动未完成，请查看下方处理建议"
                     let message = Self.friendlyError(error.localizedDescription)
                     self.appendLog(message); self.notify()
@@ -364,10 +429,12 @@ final class AppModel {
         guard let target = Self.adbTarget(value) else { status = Self.invalidDeviceAddress; notify(); return }
         isBusy = true; status = "正在重启时钟，重启后会回到原生界面…"; notify()
         DispatchQueue.global(qos: .userInitiated).async {
-            do { let adb = Self.adbPath(); let args = adb == "/usr/bin/env" ? ["adb", "-s", target, "reboot"] : ["-s", target, "reboot"]; _ = try Self.run(adb, args: args); self.updateOnMain { self.isBusy = false; self.status = "已发出重启命令；设备启动后应恢复原生界面"; self.notify() } }
+            do { let adb = Self.adbPath(); let port = try Self.connectDevice(target); let args = adb == "/usr/bin/env" ? ["adb", "-s", target, "reboot"] : ["-s", target, "reboot"]; _ = try Self.run(adb, args: args, adbServerPort: port); self.updateOnMain { self.isBusy = false; self.status = "已发出重启命令；设备启动后应恢复原生界面"; self.notify() } }
             catch { self.updateOnMain { self.isBusy = false; self.status = "重启失败：\(error.localizedDescription)"; self.notify() } }
         }
     }
+
+    func stopADBServer() { Self.adbServer.stop() }
 
     func save() {
         let config = StoredConfig(deviceIP: deviceIP, hostIP: hostIP, focusMinutes: focusMinutes, restMinutes: restMinutes, repoPath: repoPath, customAudioName: hasCustomAudio ? customAudioName : nil)
@@ -475,9 +542,9 @@ final class AppModel {
     private func notify() { DispatchQueue.main.async { self.onChange?() } }
     private func updateOnMain(_ work: @escaping () -> Void) { DispatchQueue.main.async(execute: work) }
 
-    private static func run(_ executable: String, args: [String] = [], cwd: String? = nil) throws -> String {
+    private static func run(_ executable: String, args: [String] = [], cwd: String? = nil, adbServerPort: UInt16? = nil) throws -> String {
         let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = args; if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
-        var environment = ProcessInfo.processInfo.environment; environment["PATH"] = toolPath(); process.environment = environment
+        var environment = ProcessInfo.processInfo.environment; environment["PATH"] = toolPath(); if let adbServerPort { environment["ADB_SERVER_PORT"] = String(adbServerPort) }; process.environment = environment
         let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe; try process.run(); let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""; process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw RunnerError.failed(output.isEmpty ? "命令退出码：\(process.terminationStatus)" : output) }; return output
     }
@@ -515,6 +582,53 @@ final class AppModel {
         guard let port, port > 0 else { return nil }
         return "\(parts[0]):\(port)"
     }
+    private static func connectDevice(_ target: String) throws -> UInt16 {
+        try probeDevicePort(target)
+        let adb = adbPath()
+        let serverPort = try adbServer.ensureRunning(adb: adb)
+        var lastError = "未知错误"
+        for attempt in 1...2 {
+            do {
+                let output = try run(adb, args: adb == "/usr/bin/env" ? ["adb", "connect", target] : ["connect", target], adbServerPort: serverPort)
+                let connected = output.lowercased().split(separator: "\n").contains {
+                    $0.hasPrefix("connected to ") || $0.hasPrefix("already connected to ")
+                }
+                guard connected else { throw RunnerError.failed(output.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                let state = try run(adb, args: adb == "/usr/bin/env" ? ["adb", "-s", target, "get-state"] : ["-s", target, "get-state"], adbServerPort: serverPort)
+                guard state.trimmingCharacters(in: .whitespacesAndNewlines) == "device" else { throw RunnerError.failed("ADB 未返回 device 状态：\(state)") }
+                return serverPort
+            } catch {
+                lastError = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                if attempt == 1 { Thread.sleep(forTimeInterval: 1) }
+            }
+        }
+        throw RunnerError.failed("\(target) 的 TCP 端口可达，但 GUI 专用 ADB 服务无法连接。请检查 macOS“本地网络”权限及拦截 adb 的网络工具，退出并重新打开 GUI 后重试。原始错误：\(lastError)")
+    }
+    private static func probeDevicePort(_ target: String) throws {
+        let parts = target.split(separator: ":")
+        guard parts.count == 2, let portNumber = UInt16(parts[1]), let port = NWEndpoint.Port(rawValue: portNumber) else {
+            throw RunnerError.failed(invalidDeviceAddress)
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(String(parts[0])), port: port, using: .tcp)
+        let completed = DispatchSemaphore(value: 0)
+        var failure: Error?
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready: completed.signal()
+            case .failed(let error): failure = error; completed.signal()
+            default: break
+            }
+        }
+        connection.start(queue: DispatchQueue(label: "tc002-focus-device-probe"))
+        let timedOut = completed.wait(timeout: .now() + 12) == .timedOut
+        connection.cancel()
+        if timedOut {
+            throw RunnerError.failed("Mac 连接 \(target) 超时。请确认时钟当前 IP、Wi-Fi ADB，以及 macOS“本地网络”权限。")
+        }
+        if let failure {
+            throw RunnerError.failed("Mac 无法连接 \(target) 的 TCP 端口。请核对时钟当前 IP、Wi-Fi 和 macOS“本地网络”权限。底层错误：\(failure.localizedDescription)")
+        }
+    }
     private static func adbPath() -> String { resolvedExecutable("adb", preferred: ["/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/usr/bin/adb"]) ?? "/usr/bin/env" }
     private static func nodePath() -> String { resolvedNodePath() ?? "/usr/bin/env" }
     private static func resolvedNodePath() -> String? {
@@ -550,6 +664,7 @@ final class AppModel {
     }
     private static func friendlyError(_ message: String) -> String {
         if message.contains("找不到 EMQX") || message.contains("brew --prefix emqx") { return "EMQX 未安装。请先运行一键准备，或执行 brew install emqx。\n\(message)" }
+        if message.contains("TCP 端口") || message.contains("Mac 连接") { return message }
         if message.contains("ADB") || message.contains("adb") { return "无法连接 TC002。请确认时钟已开启 Wi-Fi ADB，且与 Mac 在同一局域网。\n\(message)" }
         if message.contains("system status") || message.contains("Lark") || message.contains("钥匙串") { return "Lark 配置不完整。请确认自建应用已开通系统状态权限，然后重新授权。\n\(message)" }
         return message
@@ -582,7 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static func main() { let app = NSApplication.shared; let delegate = AppDelegate(); app.delegate = delegate; app.setActivationPolicy(.regular); withExtendedLifetime(delegate) { app.run() } }
     func applicationDidFinishLaunching(_ notification: Notification) { restoreAppearance(); model.onChange = { [weak self] in self?.refresh() }; model.onEnvironmentInstallOffer = { [weak self] packages, message in self?.offerEnvironmentInstall(packages: packages, reason: message) }; buildWindow(); model.load(); populateFieldsFromModel(); refresh(); model.autoValidateSavedConfiguration(); appearanceObserver = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in self?.refresh() } }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) { collectFields(); model.save() }
+    func applicationWillTerminate(_ notification: Notification) { collectFields(); model.save(); model.stopADBServer() }
 
     private func buildWindow() {
         let backdrop = NSVisualEffectView()
