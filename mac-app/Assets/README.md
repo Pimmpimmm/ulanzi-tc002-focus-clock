@@ -1,0 +1,13 @@
+# Home material
+
+`OakTexture.png` is a project-owned background generated with the built-in imagegen tool on 2026-10-13. It is packaged inside the App; no remote image, generator, or API key is needed at runtime. The same bitmap fills all three pages without an inset border, board bevel, or cast shadow. A light veil or dark tint maintains readability. Configuration retains stable input surfaces, uses opaque warm secondary ink, and logs are transparent over the shared wood. The dial retains its raised warm-ivory face, bronze rim, espresso numerals, and contrasting bronze/green ticks; dark mode uses ivory on a deep wooden face. Dial depth effects are code-native, not baked into a replacement image.
+
+Final generation prompt:
+
+> Use case: photorealistic-natural. Asset type: a full-bleed wood texture background asset for a minimalist native focus timer app, NOT a UI mockup. Generate a square high-resolution top-down orthographic close-up of a single continuous pale natural oak veneer surface. Very fine, gently flowing mostly vertical wood grain, believable natural material, warm beige sand and muted honey tones, matte unfinished satin wood. Low-contrast quiet elegant texture so dark clock numbers and controls can remain readable on it; subtle grain visible rather than an empty flat color. Even diffuse lighting over entire image. Edge-to-edge continuous surface, no plank seams, no frame, no perspective, no large knots or scratches, no objects, no clock, no interface, no text, no logos, no watermark, no vignette, no directional cast shadows.
+
+Navigation uses Apple's `NSGlassEffectView` on macOS 26+ when built with a supporting SDK, and enables its interactive response on macOS 27+ with a supporting SDK. Older systems or SDKs retain the compatible `NSVisualEffectView` material; they do not get native Liquid Glass. No private rendering APIs are used.
+
+One translucent selection highlight moves across the navigation. Clicks animate it, horizontal dragging follows the pointer with a small elastic stretch, and release snaps to the nearest page. Dragging vertically outside the bar, Escape, or losing window focus cancels the gesture. Focused navigation supports left/right arrow keys. Pointer interaction does not show a blue focus ring; keyboard focus uses a small warm marker. Reduced Motion disables slide animation and stretching, while retaining direct drag control. The selection highlight is a thin fill, not a second stacked glass material.
+
+Design references: [Introducing Liquid Glass](https://developer.apple.com/videos/play/wwdc2025/219/) and [NSGlassEffectView](https://developer.apple.com/documentation/appkit/nsglasseffectview).
